@@ -281,10 +281,31 @@ int multirom(const char *rom_to_boot)
         ERROR(NO_KEXEC_LOG_TEXT ":    to Recovery\n"); exit = (EXIT_REBOOT_RECOVERY | EXIT_UMOUNT);  goto finish;      // reboot to recovery
     }
 #endif
-
     if(rom_to_boot != NULL)
     {
-        struct multirom_rom *rom = multirom_get_rom(&s, rom_to_boot, NULL);
+        struct multirom_rom *rom = NULL;
+
+        // Parse rom_to_boot should be: Name_of_ROM++uuid=xxxx  (the '++uuid=xxxx' is optional but needed for external ROMs)
+        char * uuid_ptr = strstr(rom_to_boot, "++uuid=");
+        if(uuid_ptr == NULL)
+        {
+            rom = multirom_get_rom(&s, rom_to_boot, NULL);
+        }
+        else
+        {
+            char name[MAX_ROM_NAME_LEN + 1];
+            char part_uuid[36+4+1];
+
+            strncpy(name, rom_to_boot, uuid_ptr - rom_to_boot);
+            name[uuid_ptr - rom_to_boot] = 0;
+
+            strcpy(part_uuid, uuid_ptr + sizeof("++uuid=") - 1);
+
+            multirom_update_and_scan_for_external_roms(&s, part_uuid);
+
+            rom = multirom_get_rom(&s, name, part_uuid);
+        }
+
         if(rom)
         {
             // Two possible scenarios: this ROM has kexec-hardboot and target
@@ -296,6 +317,14 @@ int multirom(const char *rom_to_boot)
                 s.is_second_boot = 0;
                 INFO("Booting ROM %s...\n", rom_to_boot);
             }
+#ifdef MR_NO_KEXEC
+            else if(((M(rom->type) & MASK_KEXEC) || rom->has_bootimg) && rom->type != ROM_DEFAULT)
+            {
+                to_boot = rom;
+                s.is_second_boot = 0;
+                INFO(NO_KEXEC_LOG_TEXT " Booting ROM %s...\n", rom_to_boot);
+            }
+#endif
             else
             {
                 s.current_rom = rom;
@@ -351,8 +380,16 @@ int multirom(const char *rom_to_boot)
 
 #ifdef MR_NO_KEXEC
         #define MR_NO_KEXEC_ABORT { \
-                    ERROR("NO_KEXEC: ERROR occurred in the above, aborting to recovery\n"); \
-                    exit = (EXIT_REBOOT_RECOVERY | EXIT_UMOUNT);  goto finish; \
+                    if(rom_to_boot == NULL) { \
+                        ERROR(NO_KEXEC_LOG_TEXT ": ERROR occurred in the above, aborting to recovery\n"); \
+                        exit = (EXIT_REBOOT_RECOVERY | EXIT_UMOUNT); \
+                    } \
+                    else \
+                    { \
+                        ERROR(NO_KEXEC_LOG_TEXT ": ERROR occurred in the above, failed to boot '%s'\n", rom_to_boot); \
+                        exit = EXIT_UMOUNT; \
+                    } \
+                    goto finish; \
                 }
 
         if (s.is_second_boot != 0)
@@ -578,6 +615,142 @@ static int compare_rom_names(const void *a, const void *b)
     return 0;
 }
 
+int multirom_apk_umount_usb(void)
+{
+    const char * path = "/mnt/mrom/APK";
+    DIR *d = opendir(path);
+    if(!d)
+    {
+        printf("Failed to open path %s\n", path);
+        return -1;
+    }
+
+    struct dirent *dp = NULL;
+    char dir_to_unmount[256];
+
+    while((dp = readdir(d)))
+    {
+        if(dp->d_name[0] == '.' && (dp->d_name[1] == '.' || dp->d_name[1] == 0))
+            continue;
+
+        if(dp->d_type != DT_DIR)
+            continue;
+
+        sprintf(dir_to_unmount, "%s/%s", path, dp->d_name);
+        umount(dir_to_unmount);
+        remove(dir_to_unmount);
+    }
+    closedir(d);
+
+    return 0;
+}
+
+int multirom_apk_get_roms(struct multirom_status *s)
+{
+    if(multirom_find_base_dir() == -1)
+    {
+        printf("Could not find multirom dir\n");
+        return -1;
+    }
+
+    //multirom_load_status(&s); // get internal roms from multirom_default_status
+
+    /* Get Internal Storage ROMs */
+
+    // we don't need fstab loading
+    //s->fstab = fstab_auto_load();
+    //if(!s->fstab)
+    //    return -1;
+
+    char roms_path[256];
+    sprintf(roms_path, "%s/roms/"INTERNAL_ROM_NAME, mrom_dir());
+    DIR *d = opendir(roms_path);
+    if(!d)
+    {
+        printf("Failed to open Internal ROM's folder, creating one with ROM from internal memory...\n");
+        multirom_import_internal();
+    }
+    else
+        closedir(d);
+
+    sprintf(roms_path, "%s/roms", mrom_dir());
+    d = opendir(roms_path);
+    if(!d)
+    {
+        printf("Failed to open roms dir!\n");
+        return -1;
+    }
+
+    struct dirent *dr;
+    char path[256];
+    struct multirom_rom **add_roms = NULL;
+    while((dr = readdir(d)))
+    {
+        if(dr->d_name[0] == '.')
+            continue;
+
+        if(dr->d_type != DT_DIR)
+            continue;
+
+        if(strlen(dr->d_name) > MAX_ROM_NAME_LEN)
+        {
+            printf("Skipping ROM %s, name is too long (max %d chars allowed)\n", dr->d_name, MAX_ROM_NAME_LEN);
+            continue;
+        }
+
+        //printf("Adding ROM %s\n", dr->d_name);
+
+        struct multirom_rom *rom = malloc(sizeof(struct multirom_rom));
+        memset(rom, 0, sizeof(struct multirom_rom));
+
+        rom->id = multirom_generate_rom_id();
+        rom->name = strdup(dr->d_name);
+
+        snprintf(path, sizeof(path), "%s/%s", roms_path, rom->name);
+        rom->base_path = strdup(path);
+
+        rom->type = multirom_get_rom_type(rom);
+
+        snprintf(path, sizeof(path), "%s/boot.img", rom->base_path);
+        rom->has_bootimg = access(path, R_OK) == 0 ? 1 : 0;
+
+        multirom_find_rom_icon(rom);
+
+        list_add(&add_roms, rom);
+    }
+
+    closedir(d);
+
+    if(add_roms)
+    {
+        // sort roms
+        qsort(add_roms, list_item_count(add_roms), sizeof(struct multirom_rom*), compare_rom_names);
+
+        // add them to main list
+        list_swap(&add_roms, &s->roms);
+    }
+
+    //s->current_rom = multirom_get_internal(s);
+    //if(!s->current_rom)
+    //{
+        //printf("No internal rom found!\n");
+        //return -1;
+    //}
+
+
+    /* Get External ROMs */
+    multirom_update_partitions(s);
+
+    int i;
+    for(i = 0; s->partitions && s->partitions[i]; ++i) {
+        //printf("part=%s\n", s->partitions[i]->mount_path);
+        s->partitions[i]->keep_mounted = 1; // don't unmount on exit, the APK will need access to the folders
+        multirom_scan_partition_for_roms(s, s->partitions[i]);
+    }
+
+    return 0;
+}
+
 int multirom_default_status(struct multirom_status *s)
 {
     s->is_second_boot = 0;
@@ -757,23 +930,7 @@ int multirom_load_status(struct multirom_status *s)
     // find USB drive if we're booting from it
     if(s->curr_rom_part) // && s->is_second_boot)
     {
-        struct usb_partition *p = NULL;
-        int tries = 0;
-        while(!p && tries < 10)
-        {
-            multirom_update_partitions(s);
-            p = multirom_get_partition(s, s->curr_rom_part);
-
-            if(p)
-            {
-                multirom_scan_partition_for_roms(s, p);
-                break;
-            }
-
-            ++tries;
-            ERROR("part %s not found, waiting 1s (%d)\n", s->curr_rom_part, tries);
-            sleep(1);
-        }
+        multirom_update_and_scan_for_external_roms(s, s->curr_rom_part);
     }
 
     s->current_rom = multirom_get_rom(s, current_rom, s->curr_rom_part);
@@ -2515,6 +2672,12 @@ int multirom_update_partitions(struct multirom_status *s)
             goto next_itr;
         }
 
+        if(strncmp(name, "loop", 4) == 0) // ignore loop devices
+        {
+            free(name);
+            goto next_itr;
+        }
+
         part = mzalloc(sizeof(struct usb_partition));
         part->name = name;
 
@@ -2558,8 +2721,34 @@ next_itr:
     return 0;
 }
 
+int is_mounted_properly(const char *mnt_path)
+{
+    int res = 0;
+
+    int n = 0;
+    struct dirent *d;
+    DIR *dir = opendir(mnt_path);
+    if (dir == NULL) //Not a directory or doesn't exist
+        return 0;
+
+    while ((d = readdir(dir)) != NULL)
+    {
+        if(++n > 2)
+            break;
+    }
+    closedir(dir);
+
+    if (n <= 2) //Directory Empty
+        return 0;
+    else
+        return 1;
+}
+
 int multirom_mount_usb(struct usb_partition *part)
 {
+    int res = 0;
+    part->mount_path = NULL;
+
     mkdir("/mnt", 0777);
     mkdir("/mnt/mrom", 0777);
 
@@ -2574,13 +2763,20 @@ int multirom_mount_usb(struct usb_partition *part)
     char src[256];
     snprintf(src, sizeof(src), "/dev/block/%s", part->name);
 
+    if(is_mounted_properly(path))
+    {
+        ERROR("Partition %s already mounted on %s\n", src, path);
+        res = 0;
+    }
+    else // do we do else or do we unmount and try to mount it again??
+
     if(strncmp(part->fs, "ntfs", 4) == 0)
     {
         char *cmd[] = { ntfs_path, src, path, NULL };
         if(run_cmd(cmd) != 0)
         {
             ERROR("Failed to mount %s with ntfs-3g\n", src);
-            return -1;
+            res = -1;
         }
     }
     else if(strcmp(part->fs, "exfat") == 0)
@@ -2589,17 +2785,40 @@ int multirom_mount_usb(struct usb_partition *part)
         if(run_cmd(cmd) != 0)
         {
             ERROR("Failed to mount %s with exfat\n", src);
-            return -1;
+            res = -1;
         }
     }
     else if(mount(src, path, part->fs, MS_NOATIME, "") < 0)
     {
         ERROR("Failed to mount %s (%d: %s)\n", src, errno, strerror(errno));
-        return -1;
+        res = -1;
     }
 
     part->mount_path = strdup(path);
-    return 0;
+    return res;
+}
+
+void multirom_update_and_scan_for_external_roms(struct multirom_status *s, char *part_uuid)
+{
+    struct usb_partition *p = NULL;
+    int tries = 0;
+    while(!p && tries < 30)
+    {
+        multirom_update_partitions(s);
+        p = multirom_get_partition(s, part_uuid);
+
+        if(p)
+        {
+            multirom_scan_partition_for_roms(s, p);
+            break;
+        }
+
+        ++tries;
+        ERROR("part %s not found, waiting 1s (%d)\n", s->curr_rom_part, tries);
+        sleep(1);
+    }
+
+    // multirom_dump_status(s);
 }
 
 void *multirom_usb_refresh_thread_work(void *status)
@@ -2710,6 +2929,9 @@ int multirom_copy_log(char *klog, const char *dest_path_relative)
 
 struct usb_partition *multirom_get_partition(struct multirom_status *s, char *uuid)
 {
+    // FIXME: This may need to be reconsidered, it is possible for 2 different partitions
+    //        to have the same uuid which will lead to a false positive.
+    //        Probably a good idea, to add mount point and uuid
     int i;
     for(i = 0; s->partitions && s->partitions[i]; ++i)
         if(strcmp(s->partitions[i]->uuid, uuid) == 0)
