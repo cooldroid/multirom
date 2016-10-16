@@ -104,6 +104,60 @@ static void inject_file_contexts(void)
     fclose(f);
 }
 
+static void inject_file_contexts_bin(void)
+{
+    // temporary fix till we inject the file_contexts.bin
+    DIR *d = opendir("/");
+    if(d)
+    {
+        struct dirent *dt;
+        char path[128];
+        while((dt = readdir(d)))
+        {
+            if(dt->d_type != DT_REG)
+                continue;
+
+            if(strendswith(dt->d_name, ".rc"))
+            {
+                snprintf(path, sizeof(path), "/%s", dt->d_name);
+                char line[512];
+                char *tmp_name = NULL;
+                FILE *f_in, *f_out;
+
+                f_in = fopen(path, "re");
+                if(!f_in)
+                    return;
+
+                const int size = strlen(path) + 5;
+                tmp_name = malloc(size);
+                snprintf(tmp_name, size, "%s-new", path);
+                f_out = fopen(tmp_name, "we");
+                if(!f_out)
+                {
+                    fclose(f_in);
+                    free(tmp_name);
+                    return;
+                }
+
+                while(fgets(line, sizeof(line), f_in))
+                {
+                    if(strstr(line, "restorecon_recursive ") && (strstr(line, "/data") || strstr(line, "/system") || strstr(line, "/cache") || strstr(line, "/mnt")))
+                        fputc('#', f_out);
+                    fputs(line, f_out);
+                }
+
+                fclose(f_in);
+                fclose(f_out);
+                rename(tmp_name, path);
+                free(tmp_name);
+
+                chmod(path, 0750);
+            }
+        }
+        closedir(d);
+    }
+}
+
 void rom_quirks_on_initrd_finalized(void)
 {
     // walk over all _regular_ files in /
@@ -126,6 +180,15 @@ void rom_quirks_on_initrd_finalized(void)
             // MultiROM folders don't have any context
             if(strcmp(dt->d_name, "file_contexts") == 0)
                 inject_file_contexts();
+
+            // Android N is using the binary format of file_contexts, until we have
+            // and inject for it, like for the above text format of file_contexts
+            // we'll go back to the old method and remove
+            // * restorecon_recursive /data
+            // * restorecon_recursive /mnt
+            // TODO: check format of file_context by checking the magic
+            if(strcmp(dt->d_name, "file_contexts.bin") == 0)
+                inject_file_contexts_bin();
 
             // franco.Kernel includes script init.fk.sh which remounts /system as read only
             // comment out lines with mount and /system in all .sh scripts in /
