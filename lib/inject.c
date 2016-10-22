@@ -26,6 +26,9 @@
 #include "log.h"
 #include "util.h"
 #include "../version.h"
+#ifdef MR_NO_KEXEC
+#include "../no_kexec.h"
+#endif
 
 // clone libbootimg to /system/extras/ from
 // https://github.com/Tasssadar/libbootimg.git
@@ -175,6 +178,14 @@ int inject_bootimg(const char *img_path, int force)
     char initrd_path[256];
     static const char *initrd_tmp_name = "/inject-initrd.img";
 
+#ifdef BOARD_BOOTIMAGE_PARTITION_SIZE
+    if(access(img_path, F_OK) == 0)
+    {
+        INFO("Truncating fake boot.img to %d bytes\n", BOARD_BOOTIMAGE_PARTITION_SIZE);
+        truncate(img_path, BOARD_BOOTIMAGE_PARTITION_SIZE);
+    }
+#endif
+
     if(libbootimg_init_load(&img, img_path, LIBBOOTIMG_LOAD_ALL) < 0)
     {
         ERROR("Could not open boot image (%s)!\n", img_path);
@@ -182,7 +193,11 @@ int inject_bootimg(const char *img_path, int force)
     }
 
     img_ver = get_img_trampoline_ver(&img);
+#ifndef MR_NO_KEXEC
     if(!force && img_ver == VERSION_TRAMPOLINE)
+#else
+    if(!force && img_ver == VERSION_TRAMPOLINE && img.hdr.name[BOOT_NAME_SIZE-2] == VERSION_NO_KEXEC)
+#endif
     {
         INFO("No need to update trampoline.\n");
         res = 0;
@@ -201,6 +216,9 @@ int inject_bootimg(const char *img_path, int force)
     {
         // Update the boot.img
         snprintf((char*)img.hdr.name, BOOT_NAME_SIZE, "tr_ver%d", VERSION_TRAMPOLINE);
+#ifdef MR_NO_KEXEC
+        img.hdr.name[BOOT_NAME_SIZE-2] = VERSION_NO_KEXEC;
+#endif
 #ifdef MR_RD_ADDR
         img.hdr.ramdisk_addr = MR_RD_ADDR;
 #endif
